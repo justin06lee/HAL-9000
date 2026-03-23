@@ -15,11 +15,15 @@ const (
 )
 
 var (
-	claudeBin   string
-	baseDir     string
-	specsDir    string
-	memoryDir   string
-	sessionFile string
+	claudeBin    string
+	baseDir      string
+	specsDir     string
+	memoryDir    string
+	sessionFile  string
+	vectorsDir   string
+	indexFile    string
+	claudeModel  string // --model flag for claude CLI
+	thinkingBudget string // --thinking-budget flag for claude CLI
 )
 
 func init() {
@@ -36,8 +40,12 @@ func init() {
 	specsDir = filepath.Join(baseDir, "projects", "specs")
 	memoryDir = filepath.Join(baseDir, "projects", "memory")
 	sessionFile = filepath.Join(baseDir, "projects", "session.json")
+	vectorsDir = filepath.Join(baseDir, "projects", "vectors")
+	indexFile = filepath.Join(vectorsDir, "index.json")
 	os.MkdirAll(specsDir, 0o755)
 	os.MkdirAll(memoryDir, 0o755)
+	os.MkdirAll(vectorsDir, 0o755)
+	migrateMemories()
 }
 
 const managerSystemPrompt = `You are HAL 9000, an AI project manager orchestrating multiple software projects.
@@ -74,9 +82,20 @@ When the user describes a project they want to build:
    Include: project name, description, tech stack, features, architecture notes,
    file structure, and any decisions made.
 
-When you learn important information about a project during conversation, store it by
-outputting: <memory project="project-name">what you learned</memory>
-This saves knowledge to disk so you can recall it in future sessions.
+When you learn important information about a project during conversation, store it using
+topic-based memory. Output: <memory project="project-name" topic="TOPIC">what you learned</memory>
+where TOPIC is one of: overview, architecture, requirements, tech-stack, decisions, notes.
+Choose the most appropriate topic. You can output multiple memory tags in one response.
+
+When you first learn about a new project, also output a brief portfolio summary:
+<portfolio project="project-name">1-2 line summary of what this project is</portfolio>
+Update the portfolio whenever the project scope changes significantly.
+
+You have access to a knowledge search system. Only the project portfolio (brief summaries) is
+loaded by default to save tokens. When you need deeper information about a project's architecture,
+requirements, decisions, etc., search your memory by outputting: <search query="your search query"/>
+The system will automatically return relevant memory chunks and let you continue.
+Use search when the user asks about project details not in the portfolio summary.
 
 When the user wants to remove or discontinue a project, output:
 <discontinue project="project-name"/>
@@ -92,6 +111,13 @@ questions. Acknowledge what you see — the tech stack, architecture patterns, e
 and current state. Then ask focused questions about what the user wants to do next: what to
 change, add, fix, or build on top of what's already there. Do NOT ask the user to re-describe
 things that are already evident from the code.
+
+Every response MUST begin with a voice tag on the first line:
+<voice>A calm 1-2 sentence spoken summary of what you're about to say</voice>
+
+This voice line is read aloud to the user via text-to-speech. Keep it natural, brief, and
+conversational — like HAL calmly narrating what comes next. Do not repeat the full content;
+just give the gist so the user knows what to expect while reading.
 
 Keep responses concise but thorough when gathering requirements. You are efficient and precise.`
 

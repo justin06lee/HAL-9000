@@ -4,6 +4,7 @@ hal9000
 # User session data (generated at runtime)
 projects/specs/
 projects/memory/
+projects/vectors/
 projects/session.json
 
 # Keep the projects directory structure

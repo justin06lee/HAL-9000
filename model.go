@@ -1,19 +1,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // ── Message types ───────────────────────────────────────────
@@ -60,7 +60,7 @@ type model struct {
 	input         textarea.Model
 
 	messages    []chatMessage
-	halThinking bool // track thinking state instead of string matching
+	halThinking    bool   // track thinking state instead of string matching
 
 	workerStatuses  map[string]workerStatus
 	conversation    *halConversation
@@ -72,16 +72,40 @@ type model struct {
 	pendingQuestions []workerQuestionMsg
 	lastHALSpoke    time.Time // when HAL last produced a message (for eye gaze)
 	inspecting      string    // worker name being inspected ("" = normal chat)
+	chatScroll      int       // lines scrolled up from bottom (0 = pinned to bottom)
+	thinkingFrame   int       // animation frame counter for thinking shimmer
+	pendingConfirm  string    // pending confirmation action (e.g. "forget-all", "forget:projectname")
+	quitPending     time.Time // when first Ctrl+C was pressed (zero = not pending)
+	escPending      time.Time // when first Esc was pressed for input clear
+
+	// Paste collapse
+	pastedContent string // full pasted text (stored when paste exceeds threshold)
+	pasteLines    int    // number of lines in the paste
+
+	lastSentText string // last sent message text (for restore on interrupt)
+
+	// Interactive picker
+	pickerActive  bool
+	pickerTitle   string
+	pickerOptions []string
+	pickerCursor  int
+	pickerAction  string // what command triggered the picker
+
+	// Model picker: two-section (model + effort)
+	modelPickerSection  int // 0 = model, 1 = effort
+	effortCursor        int // index into effortLevels
+	modelPickerSelected int // -1 = not yet selected, >= 0 = locked model index
+	effortSelected      int // -1 = not yet selected, >= 0 = locked effort index
 }
 
 func newModel() model {
 	ti := textarea.New()
-	ti.Placeholder = "Talk to HAL... (Ctrl+B build, Ctrl+Q quit)"
+	ti.Placeholder = "Talk to HAL... (Enter send, Shift+Enter newline, Ctrl+B build)"
 	ti.Focus()
 	ti.CharLimit = 2000
 	ti.ShowLineNumbers = false
 	ti.SetHeight(3)
-	ti.KeyMap.InsertNewline.SetEnabled(false) // Enter sends, not newline
+	ti.KeyMap.InsertNewline.SetKeys("shift+enter")
 
 	m := model{
 		startTime:      time.Now(),
@@ -113,17 +137,19 @@ func newModel() model {
 			m.orch.mu.Unlock()
 		}
 
-		greeting := timeGreeting()
-		m.messages = append(m.messages, chatMessage{
-			role: "hal",
-			text: greeting + " I have restored our previous session. I am ready to continue.",
-		})
-		m.lastHALSpoke = time.Now()
-		m.voice.sayShort(greeting + " Session restored.")
-
-		if len(m.projectSpecs) > 0 {
-			m.addMsg("system", "", fmt.Sprintf("Restored %d project(s) and %d worker(s).", len(m.projectSpecs), len(sd.Workers)), nil)
+		// Restore chat messages
+		if len(sd.Messages) > 0 {
+			for _, msg := range sd.Messages {
+				m.messages = append(m.messages, chatMessage{
+					role:    msg.Role,
+					name:    msg.Name,
+					text:    msg.Text,
+					options: msg.Options,
+				})
+			}
 		}
+		m.lastHALSpoke = time.Now()
+		m.voice.sayShort(timeGreeting())
 	} else {
 		greeting := timeGreeting()
 		m.messages = append(m.messages, chatMessage{
@@ -176,8 +202,11 @@ func waitForQuestion(ch <-chan workerQuestionMsg) tea.Cmd {
 func (m *model) addMsg(role, name, text string, options []string) {
 	m.messages = append(m.messages, chatMessage{role: role, name: name, text: text, options: options})
 	if len(m.messages) > maxMessages {
-		// Keep last maxMessages entries, drop oldest
 		m.messages = m.messages[len(m.messages)-maxMessages:]
+	}
+	// Auto-scroll to bottom if user is near the bottom
+	if m.chatScroll <= 3 {
+		m.chatScroll = 0
 	}
 }
 
@@ -193,14 +222,149 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.input.SetWidth(max(20, msg.Width-28))
 
+	case tea.MouseWheelMsg:
+		if msg.Button == tea.MouseWheelUp {
+			m.chatScroll += 3
+		} else if msg.Button == tea.MouseWheelDown {
+			m.chatScroll = max(0, m.chatScroll-3)
+		}
+		// Consume all mouse events — don't let them reach the textarea
+		return m, tea.Batch(cmds...)
+
 	case tickMsg:
+		if m.halThinking {
+			m.thinkingFrame++
+		}
 		cmds = append(cmds, tickCmd())
 
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		pasted := msg.Content
+		lines := strings.Count(pasted, "\n") + 1
+		if lines > 4 {
+			m.pastedContent = pasted
+			m.pasteLines = lines
+			existing := m.input.Value()
+			summary := fmt.Sprintf("[pasted %d lines]", lines)
+			m.input.SetValue(existing + summary)
+			m.input.CursorEnd()
+			return m, tea.Batch(cmds...)
+		}
+		// Small pastes fall through to textarea Update below
+
+	case tea.KeyPressMsg:
+		// Reset placeholder on any keypress (after quit/esc warnings)
+		defaultPlaceholder := "Talk to HAL... (Enter send, Shift+Enter newline, Ctrl+B build)"
+		if m.input.Placeholder != defaultPlaceholder {
+			if msg.String() != "ctrl+c" && msg.String() != "ctrl+q" && msg.String() != "esc" {
+				m.input.Placeholder = defaultPlaceholder
+			}
+		}
+
+		// Handle picker mode first
+		if m.pickerActive {
+			if m.pickerAction == "model" {
+				// Two-section model picker: Enter locks selection, Esc confirms & exits
+				totalModels := len(claudeModelList)
+				totalEfforts := len(effortLevels)
+				switch msg.String() {
+				case "up", "k":
+					if m.modelPickerSection == 1 {
+						if m.effortCursor > 0 {
+							m.effortCursor--
+						} else {
+							m.modelPickerSection = 0
+							m.pickerCursor = totalModels - 1
+						}
+					} else if m.pickerCursor > 0 {
+						m.pickerCursor--
+					}
+				case "down", "j":
+					if m.modelPickerSection == 0 {
+						if m.pickerCursor < totalModels-1 {
+							m.pickerCursor++
+						} else {
+							m.modelPickerSection = 1
+							m.effortCursor = 0
+						}
+					} else if m.effortCursor < totalEfforts-1 {
+						m.effortCursor++
+					}
+				case "enter":
+					// Lock in current section's choice
+					if m.modelPickerSection == 0 {
+						m.modelPickerSelected = m.pickerCursor
+						// Auto-advance to effort section
+						m.modelPickerSection = 1
+					} else {
+						m.effortSelected = m.effortCursor
+						// Both selected — confirm and exit
+						m.pickerActive = false
+						m = handleModelPickerConfirm(m)
+						saveSession(&m)
+					}
+				case "esc":
+					// If anything was selected, apply it and exit
+					m.pickerActive = false
+					if m.modelPickerSelected >= 0 || m.effortSelected >= 0 {
+						m = handleModelPickerConfirm(m)
+						saveSession(&m)
+					} else {
+						m.addMsg("system", "", "Cancelled.", nil)
+					}
+				}
+			} else {
+				// Standard picker
+				switch msg.String() {
+				case "up", "k":
+					if m.pickerCursor > 0 {
+						m.pickerCursor--
+					}
+				case "down", "j":
+					if m.pickerCursor < len(m.pickerOptions)-1 {
+						m.pickerCursor++
+					}
+				case "enter":
+					selected := m.pickerOptions[m.pickerCursor]
+					action := m.pickerAction
+					m.pickerActive = false
+					m = handlePickerSelect(m, action, selected)
+					saveSession(&m)
+				case "esc":
+					m.pickerActive = false
+					m.addMsg("system", "", "Cancelled.", nil)
+				}
+			}
+			return m, tea.Batch(cmds...)
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "ctrl+q":
-			m.orch.shutdown()
-			return m, tea.Quit
+			if m.halThinking {
+				m.conversation.interrupt()
+				m.halThinking = false
+				// Restore the sent message back to input
+				if m.lastSentText != "" {
+					m.input.SetValue(m.lastSentText)
+					m.lastSentText = ""
+					// Remove the user message that was just sent
+					for i := len(m.messages) - 1; i >= 0; i-- {
+						if m.messages[i].role == "user" {
+							m.messages = append(m.messages[:i], m.messages[i+1:]...)
+							break
+						}
+					}
+				}
+				m.addMsg("system", "", "Interrupted — message restored to input.", nil)
+				return m, tea.Batch(cmds...)
+			}
+			if !m.quitPending.IsZero() && time.Since(m.quitPending) < 2*time.Second {
+				m.orch.shutdown()
+				saveSession(&m)
+				return m, tea.Quit
+			}
+			m.quitPending = time.Now()
+			m.input.Placeholder = "Press Ctrl+C again to quit"
+			return m, tea.Batch(cmds...)
 		case "ctrl+b":
 			var cmd tea.Cmd
 			m, cmd = handleStartBuild(m)
@@ -212,40 +376,265 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				copyToClipboard(text)
 				m.addMsg("system", "", "Copied last HAL response to clipboard.", nil)
 			}
-		case "ctrl+w":
-			m = cycleInspect(m)
+		case "pgup", "shift+up":
+			m.chatScroll += 10
+		case "pgdown", "shift+down":
+			m.chatScroll = max(0, m.chatScroll-10)
+		case "home":
+			m.chatScroll = 999999 // will be clamped in view
+		case "end":
+			m.chatScroll = 0
 		case "esc":
+			if m.halThinking {
+				m.conversation.interrupt()
+				m.halThinking = false
+				if m.lastSentText != "" {
+					m.input.SetValue(m.lastSentText)
+					m.lastSentText = ""
+					for i := len(m.messages) - 1; i >= 0; i-- {
+						if m.messages[i].role == "user" {
+							m.messages = append(m.messages[:i], m.messages[i+1:]...)
+							break
+						}
+					}
+				}
+				m.addMsg("system", "", "Interrupted — message restored to input.", nil)
+				return m, tea.Batch(cmds...)
+			}
 			if m.inspecting != "" {
 				m.inspecting = ""
 				m.addMsg("system", "", "Exited inspection mode.", nil)
+			} else if m.input.Value() != "" {
+				if !m.escPending.IsZero() && time.Since(m.escPending) < 2*time.Second {
+					m.input.SetValue("")
+					m.pastedContent = ""
+					m.pasteLines = 0
+					m.escPending = time.Time{}
+				} else {
+					m.escPending = time.Now()
+					m.input.Placeholder = "Press Esc again to clear input"
+				}
 			}
 		case "enter":
 			text := strings.TrimSpace(m.input.Value())
+			// Expand collapsed paste back to full content
+			if m.pastedContent != "" {
+				summary := fmt.Sprintf("[pasted %d lines]", m.pasteLines)
+				text = strings.Replace(text, summary, m.pastedContent, 1)
+				m.pastedContent = ""
+				m.pasteLines = 0
+			}
 			if text != "" {
+				m.lastSentText = text
 				m.input.SetValue("")
 				m.addMsg("user", "", text, nil)
+
+				// Handle pending confirmation
+				if m.pendingConfirm != "" {
+					action := m.pendingConfirm
+					m.pendingConfirm = ""
+					lower := strings.ToLower(text)
+					if lower == "yes" || lower == "y" {
+						if action == "forget-all" {
+							deleteAllMemory()
+							go rebuildIndex()
+							m.addMsg("system", "", "All memory wiped.", nil)
+						} else if strings.HasPrefix(action, "forget:") {
+							proj := action[7:]
+							deleteMemory(proj)
+							go rebuildIndex()
+							m.addMsg("system", "", fmt.Sprintf("Memory for '%s' deleted.", proj), nil)
+						}
+					} else {
+						m.addMsg("system", "", "Cancelled.", nil)
+					}
+					saveSession(&m)
+					return m, tea.Batch(cmds...)
+				}
 
 				// Handle slash commands
 				if cmd := parseCommand(text); cmd != nil {
 					switch cmd.name {
 					case "discontinue":
-						m = handleDiscontinue(m, cmd.arg)
+						if cmd.arg != "" {
+							m = handleDiscontinue(m, cmd.arg)
+						} else {
+							names := projectNames(m.projectSpecs)
+							if len(names) == 0 {
+								m.addMsg("system", "", "No projects to discontinue.", nil)
+							} else {
+								m.pickerActive = true
+								m.pickerTitle = "Select project to discontinue:"
+								m.pickerOptions = names
+								m.pickerCursor = 0
+								m.pickerAction = "discontinue"
+							}
+						}
 						return m, tea.Batch(cmds...)
 					case "inspect":
 						if cmd.arg != "" {
 							m.inspecting = cmd.arg
 							m.addMsg("system", "", fmt.Sprintf("Inspecting worker: %s (Esc to exit)", cmd.arg), nil)
+						} else {
+							names := m.orch.workerNames()
+							if len(names) == 0 {
+								m.addMsg("system", "", "No workers to inspect.", nil)
+							} else {
+								m.pickerActive = true
+								m.pickerTitle = "Select worker to inspect:"
+								m.pickerOptions = names
+								m.pickerCursor = 0
+								m.pickerAction = "inspect"
+							}
 						}
 						return m, tea.Batch(cmds...)
 					case "scan":
 						if cmd.arg != "" {
-							scanPath := resolvePath(cmd.arg)
+							arg := cmd.arg
+							// Treat "/projectA" as relative "projectA" unless it looks like an absolute path
+							// (i.e., has more than one segment like /Users/... or /home/...)
+							if strings.HasPrefix(arg, "/") && !strings.Contains(arg[1:], "/") {
+								arg = arg[1:]
+							}
+							scanPath := resolvePath(arg)
 							m.halThinking = true
+								m.thinkingFrame = 0
 							m.addMsg("system", "", fmt.Sprintf("Scanning repository: %s ...", scanPath), nil)
 							conv := m.conversation
 							cmds = append(cmds, scanAndSendToHAL(conv, scanPath, ""))
 						} else {
 							m.addMsg("system", "", "Usage: /scan <path-to-repo>", nil)
+						}
+						return m, tea.Batch(cmds...)
+					case "search":
+						if cmd.arg != "" {
+							results := runRAGSearch(cmd.arg)
+							if results == "" || strings.Contains(results, "No relevant") {
+								m.addMsg("system", "", fmt.Sprintf("No results found for: %s", cmd.arg), nil)
+							} else {
+								m.addMsg("system", "", fmt.Sprintf("Search results for \"%s\":\n%s", cmd.arg, results), nil)
+							}
+						} else {
+							m.addMsg("system", "", "Usage: /search <query>", nil)
+						}
+						return m, tea.Batch(cmds...)
+					case "memory":
+						if cmd.arg != "" {
+							topics := listProjectTopics(cmd.arg)
+							if len(topics) == 0 {
+								m.addMsg("system", "", fmt.Sprintf("No memory found for project: %s", cmd.arg), nil)
+							} else {
+								m.addMsg("system", "", fmt.Sprintf("Memory topics for %s: %s", cmd.arg, strings.Join(topics, ", ")), nil)
+							}
+						} else {
+							names := listMemoryProjects()
+							if len(names) == 0 {
+								m.addMsg("system", "", "No project memory stored.", nil)
+							} else {
+								m.pickerActive = true
+								m.pickerTitle = "Select project to view memory:"
+								m.pickerOptions = names
+								m.pickerCursor = 0
+								m.pickerAction = "memory"
+							}
+						}
+						return m, tea.Batch(cmds...)
+					case "clear":
+						if len(m.messages) > 0 {
+							m.messages = m.messages[len(m.messages)-1:]
+						}
+						m.chatScroll = 0
+						return m, tea.Batch(cmds...)
+					case "new":
+						m.conversation = &halConversation{}
+						m.messages = nil
+						m.chatScroll = 0
+						m.halThinking = false
+						m.currentQuestion = nil
+						m.pendingQuestions = nil
+						saveSession(&m)
+						greeting := timeGreeting()
+						m.addMsg("hal", "", greeting+" Fresh session started. Your projects and workers are still here.", nil)
+						return m, tea.Batch(cmds...)
+					case "model":
+						if cmd.arg != "" {
+							claudeModel = cmd.arg
+							m.addMsg("system", "", fmt.Sprintf("Model set to: %s", claudeModel), nil)
+						} else {
+							// Find current model cursor
+							cur := 0
+							for i, entry := range claudeModelList {
+								if entry.id == claudeModel {
+									cur = i
+									break
+								}
+							}
+							// Find current effort cursor
+							eCur := 1 // default to "medium"
+							for i, e := range effortLevels {
+								if e == thinkingBudget {
+									eCur = i
+									break
+								}
+							}
+							m.pickerActive = true
+							m.pickerAction = "model"
+							m.pickerCursor = cur
+							m.effortCursor = eCur
+							m.modelPickerSection = 0
+							m.modelPickerSelected = -1
+							m.effortSelected = -1
+						}
+						return m, tea.Batch(cmds...)
+					case "commands":
+						helpText := `Projects
+  /scan <path>        Scan & memorize a repo
+  /discontinue        Remove a project
+  /inspect            View worker output
+
+Memory
+  /memory             Browse stored memory
+  /search <query>     Search memory (RAG)
+  /forget <project>   Delete project memory
+  /forget all         Delete ALL memory
+
+Settings
+  /model              Change model & thinking effort
+  /new                Start a fresh session
+  /commands           Show this help
+
+Keys
+  Ctrl+B  Start build
+  Ctrl+Y  Copy last HAL response
+  Ctrl+Q  Quit`
+						m.addMsg("system", "", helpText, nil)
+						return m, tea.Batch(cmds...)
+					case "forget":
+						if cmd.arg != "" {
+							if strings.ToLower(cmd.arg) == "all" {
+								m.pendingConfirm = "forget-all"
+								m.addMsg("system", "", "This will delete ALL project memory and the RAG index. Type 'yes' to confirm.", nil)
+							} else {
+								topics := listProjectTopics(cmd.arg)
+								if len(topics) == 0 {
+									m.addMsg("system", "", fmt.Sprintf("No memory found for project: %s", cmd.arg), nil)
+								} else {
+									m.pendingConfirm = "forget:" + cmd.arg
+									m.addMsg("system", "", fmt.Sprintf("Delete all memory for '%s' (%s)? Type 'yes' to confirm.", cmd.arg, strings.Join(topics, ", ")), nil)
+								}
+							}
+						} else {
+							names := listMemoryProjects()
+							if len(names) == 0 {
+								m.addMsg("system", "", "No project memory stored.", nil)
+							} else {
+								opts := append(names, "── all ──")
+								m.pickerActive = true
+								m.pickerTitle = "Select project to forget:"
+								m.pickerOptions = opts
+								m.pickerCursor = 0
+								m.pickerAction = "forget"
+							}
 						}
 						return m, tea.Batch(cmds...)
 					}
@@ -261,42 +650,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Auto-detect repo paths in natural language
 					if repoPath := detectRepoPath(text); repoPath != "" {
 						m.halThinking = true
+						m.thinkingFrame = 0
 						m.addMsg("system", "", fmt.Sprintf("Detected repo path: %s — scanning...", repoPath), nil)
 						cmds = append(cmds, scanAndSendToHAL(m.conversation, repoPath, text))
 					} else {
 						m.halThinking = true
-						m.addMsg("system", "", "HAL is thinking...", nil)
+						m.thinkingFrame = 0
 						cmds = append(cmds, sendToHAL(m.conversation, text))
 					}
 				}
 			}
+			saveSession(&m)
 			return m, tea.Batch(cmds...)
 		}
 
 	case halResponseMsg:
-		// Remove thinking indicator
-		if m.halThinking {
-			m.halThinking = false
-			// Remove the last "thinking" message by scanning backwards
-			for i := len(m.messages) - 1; i >= 0; i-- {
-				if m.messages[i].role == "system" && m.messages[i].text == "HAL is thinking..." {
-					m.messages = append(m.messages[:i], m.messages[i+1:]...)
-					break
-				}
-			}
-		}
+		m.halThinking = false
+		m.lastSentText = "" // response received, no need to restore
 		if msg.err != nil {
+			if errors.Is(msg.err, errInterrupted) {
+				// Already handled by the interrupt key handler
+				return m, tea.Batch(cmds...)
+			}
 			m.addMsg("system", "", "Error: "+msg.err.Error(), nil)
 		} else {
-			m.addMsg("hal", "", msg.text, nil)
+			// Extract voice line before cleaning
+			voiceLine := extractVoice(msg.text)
+			displayText := cleanDisplayText(msg.text)
+			m.addMsg("hal", "", displayText, nil)
 			m.lastHALSpoke = time.Now()
-			m.voice.sayShort(firstSentence(msg.text))
+			if voiceLine != "" {
+				m.voice.sayAsync(voiceLine)
+			} else {
+				m.voice.sayShort(firstSentence(displayText))
+			}
 
-			// Process memory tags
-			if projName, content := extractMemory(msg.text); projName != "" {
-				if err := saveMemory(projName, content); err == nil {
-					m.addMsg("system", "", fmt.Sprintf("Saved knowledge about '%s' to memory.", projName), nil)
+			// Process memory tags (topic-based)
+			for _, mem := range extractAllMemories(msg.text) {
+				if err := saveMemory(mem.project, mem.topic, mem.content); err == nil {
+					m.addMsg("system", "", fmt.Sprintf("Saved %s/%s to memory.", mem.project, mem.topic), nil)
 				}
+			}
+
+			// Process portfolio tags
+			for _, port := range extractAllPortfolios(msg.text) {
+				if err := savePortfolio(port.project, port.summary); err == nil {
+					m.addMsg("system", "", fmt.Sprintf("Updated portfolio: %s", port.project), nil)
+				}
+			}
+
+			// Rebuild vector index async after any saves
+			if len(extractAllMemories(msg.text)) > 0 || len(extractAllPortfolios(msg.text)) > 0 {
+				go rebuildIndex()
 			}
 
 			// Process discontinue tags
@@ -384,18 +789,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitForQuestion(m.orch.questionCh))
 	}
 
+	// Pre-resize textarea before it processes the newline keypress,
+	// so the viewport is tall enough and doesn't scroll away from line 1.
+	if kp, ok := msg.(tea.KeyPressMsg); ok && kp.String() == "shift+enter" {
+		newH := max(3, min(m.input.LineCount()+1, m.height/2))
+		if newH != m.input.Height() {
+			m.input.SetHeight(newH)
+		}
+	}
+
 	var inputCmd tea.Cmd
 	m.input, inputCmd = m.input.Update(msg)
 	cmds = append(cmds, inputCmd)
+
+	// Auto-resize textarea to fit content (min 3, max half the bottom panel)
+	lineCount := m.input.LineCount()
+	newH := max(3, min(lineCount, m.height/2))
+	if newH != m.input.Height() {
+		m.input.SetHeight(newH)
+	}
 
 	return m, tea.Batch(cmds...)
 }
 
 // ── Command helpers ─────────────────────────────────────────
 
+// resolveSearchLoops runs up to 3 RAG search iterations if HAL requests them.
+func resolveSearchLoops(conv *halConversation, response string) (string, error) {
+	for i := 0; i < 3; i++ {
+		query := extractSearch(response)
+		if query == "" {
+			break
+		}
+		results := runRAGSearch(query)
+		var err error
+		response, err = conv.send(results)
+		if err != nil {
+			return response, err
+		}
+	}
+	return stripSearchTags(response), nil
+}
+
 func sendToHAL(conv *halConversation, text string) tea.Cmd {
 	return func() tea.Msg {
 		response, err := conv.send(text)
+		if err != nil {
+			return halResponseMsg{err: err}
+		}
+		response, err = resolveSearchLoops(conv, response)
 		if err != nil {
 			return halResponseMsg{err: err}
 		}
@@ -414,18 +856,38 @@ func scanAndSendToHAL(conv *halConversation, repoPath, userText string) tea.Cmd 
 			return halResponseMsg{err: fmt.Errorf("scan failed: %w", err)}
 		}
 
+		// Derive project name from directory name
+		projName := filepath.Base(repoPath)
+
+		// Store the comprehensive scan as memory immediately
+		saveMemory(projName, "overview", fmt.Sprintf("Repository at: %s\nScanned automatically via /scan.\n\n%s", repoPath, extractSection(analysis, "Directory Structure")))
+		saveMemory(projName, "architecture", extractSection(analysis, "Source File Samples"))
+		saveMemory(projName, "tech-stack", extractSection(analysis, "package.json")+"\n"+extractSection(analysis, "go.mod")+"\n"+extractSection(analysis, "Cargo.toml")+"\n"+extractSection(analysis, "pyproject.toml")+"\n"+extractSection(analysis, "requirements.txt"))
+		saveMemory(projName, "notes", extractSection(analysis, "Git Repository")+"\n"+extractSection(analysis, "README.md")+"\n"+extractSection(analysis, "CLAUDE.md"))
+
+		// Update portfolio
+		savePortfolio(projName, fmt.Sprintf("Project at %s (scanned)", repoPath))
+
+		// Rebuild RAG index in background
+		go rebuildIndex()
+
 		var prompt strings.Builder
 		prompt.WriteString("I'm pointing you at an existing repository. Here's what's in it:\n\n")
 		prompt.WriteString(analysis)
 		prompt.WriteString("\n\n")
+		prompt.WriteString("I've already stored all the scan data into structured memory (overview, architecture, tech-stack, notes) and the RAG index.\n\n")
 		if userText != "" {
 			prompt.WriteString("User's message: ")
 			prompt.WriteString(userText)
 		} else {
-			prompt.WriteString("Analyze this project. Tell me what you see, then ask me questions about what I want to do with it — what to change, add, fix, or build next.")
+			prompt.WriteString("Analyze this project comprehensively. Tell me what you see — tech stack, architecture patterns, existing progress, and current state. Then ask me focused questions about what I want to do next.")
 		}
 
 		response, err := conv.send(prompt.String())
+		if err != nil {
+			return halResponseMsg{err: err}
+		}
+		response, err = resolveSearchLoops(conv, response)
 		if err != nil {
 			return halResponseMsg{err: err}
 		}
@@ -435,6 +897,22 @@ func scanAndSendToHAL(conv *halConversation, repoPath, userText string) tea.Cmd 
 			startBuild: conv.checkStartBuild(response),
 		}
 	}
+}
+
+// extractSection pulls a section from the scan analysis by heading
+func extractSection(analysis, heading string) string {
+	marker := "## " + heading
+	start := strings.Index(analysis, marker)
+	if start < 0 {
+		return ""
+	}
+	rest := analysis[start+len(marker):]
+	// Find next ## heading
+	end := strings.Index(rest, "\n## ")
+	if end < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return strings.TrimSpace(rest[:end])
 }
 
 func handleQuestionAnswer(m model, text string) (model, tea.Cmd) {
@@ -577,15 +1055,15 @@ func timeGreeting() string {
 	h := time.Now().Hour()
 	switch {
 	case h < 4:
-		return "Working late, I see."
+		return "Working late, are we?"
 	case h < 12:
-		return "Good morning."
+		return "Good morning. Shall we begin?"
 	case h < 17:
-		return "Good afternoon."
+		return "Good afternoon. What are we working on?"
 	case h < 21:
-		return "Good evening."
+		return "Good evening. At your service."
 	default:
-		return "Burning the midnight oil, I see."
+		return "Burning the midnight oil, are we?"
 	}
 }
 
@@ -624,39 +1102,6 @@ func handleDiscontinue(m model, projectName string) model {
 	return m
 }
 
-func cycleInspect(m model) model {
-	names := m.orch.workerNames()
-	if len(names) == 0 {
-		m.addMsg("system", "", "No workers to inspect.", nil)
-		return m
-	}
-	sort.Strings(names)
-
-	if m.inspecting == "" {
-		m.inspecting = names[0]
-		m.addMsg("system", "", fmt.Sprintf("Inspecting: %s (Ctrl+W cycle, Esc exit)", m.inspecting), nil)
-		return m
-	}
-
-	// Find current index and cycle
-	for i, n := range names {
-		if n == m.inspecting {
-			if i+1 < len(names) {
-				m.inspecting = names[i+1]
-				m.addMsg("system", "", fmt.Sprintf("Inspecting: %s", m.inspecting), nil)
-			} else {
-				m.inspecting = ""
-				m.addMsg("system", "", "Exited inspection mode.", nil)
-			}
-			return m
-		}
-	}
-
-	// Current not found, start over
-	m.inspecting = names[0]
-	return m
-}
-
 func lastHALMessage(messages []chatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].role == "hal" {
@@ -678,4 +1123,86 @@ func copyToClipboard(text string) {
 	}
 	cmd.Stdin = strings.NewReader(text)
 	cmd.Run()
+}
+
+// Claude model display names and IDs
+type claudeModelEntry struct {
+	display string
+	id      string
+}
+
+var claudeModelList = []claudeModelEntry{
+	{"Opus 4.6", "claude-opus-4-20250514"},
+	{"Sonnet 4.6", "claude-sonnet-4-20250514"},
+	{"Haiku 4.5", "claude-haiku-4-5-20251001"},
+}
+
+var effortLevels = []string{"low", "medium", "high", "max"}
+
+func handleModelPickerConfirm(m model) model {
+	modelIdx := m.pickerCursor
+	if m.modelPickerSelected >= 0 {
+		modelIdx = m.modelPickerSelected
+	}
+	effortIdx := m.effortCursor
+	if m.effortSelected >= 0 {
+		effortIdx = m.effortSelected
+	}
+	entry := claudeModelList[modelIdx]
+	effort := effortLevels[effortIdx]
+	claudeModel = entry.id
+	if effort == "medium" {
+		thinkingBudget = ""
+	} else {
+		thinkingBudget = effort
+	}
+	m.addMsg("system", "", fmt.Sprintf("Model: %s · Effort: %s", entry.display, effort), nil)
+	return m
+}
+
+func projectNames(specs []projectSpec) []string {
+	names := make([]string, len(specs))
+	for i, s := range specs {
+		names[i] = s.name
+	}
+	return names
+}
+
+func handlePickerSelect(m model, action, selected string) model {
+	switch action {
+	case "discontinue":
+		m = handleDiscontinue(m, selected)
+	case "inspect":
+		m.inspecting = selected
+		m.addMsg("system", "", fmt.Sprintf("Inspecting worker: %s (Esc to exit)", selected), nil)
+	case "memory":
+		// First selection: project → show topics picker
+		topics := listProjectTopics(selected)
+		if len(topics) == 0 {
+			m.addMsg("system", "", fmt.Sprintf("No memory found for project: %s", selected), nil)
+		} else {
+			m.pickerActive = true
+			m.pickerTitle = fmt.Sprintf("Memory for %s:", selected)
+			m.pickerOptions = topics
+			m.pickerCursor = 0
+			m.pickerAction = "memory-topic:" + selected
+		}
+	case "forget":
+		if selected == "── all ──" {
+			m.pendingConfirm = "forget-all"
+			m.addMsg("system", "", "This will delete ALL project memory and the RAG index. Type 'yes' to confirm.", nil)
+		} else {
+			m.pendingConfirm = "forget:" + selected
+			topics := listProjectTopics(selected)
+			m.addMsg("system", "", fmt.Sprintf("Delete all memory for '%s' (%s)? Type 'yes' to confirm.", selected, strings.Join(topics, ", ")), nil)
+		}
+	default:
+		// Handle memory-topic:projectName actions
+		if strings.HasPrefix(action, "memory-topic:") {
+			project := strings.TrimPrefix(action, "memory-topic:")
+			content := readMemoryTopic(project, selected)
+			m.addMsg("system", "", fmt.Sprintf("── %s / %s ──\n%s", project, selected, content), nil)
+		}
+	}
+	return m
 }

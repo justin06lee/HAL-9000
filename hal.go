@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,28 +14,50 @@ import (
 	"time"
 )
 
+var errInterrupted = errors.New("interrupted")
+
 // ── HAL Conversation ────────────────────────────────────────
 
 type halConversation struct {
 	mu        sync.Mutex
 	sessionID string
+	cancelMu  sync.Mutex
+	cancelFn  context.CancelFunc
+}
+
+// interrupt cancels any in-flight send
+func (h *halConversation) interrupt() {
+	h.cancelMu.Lock()
+	defer h.cancelMu.Unlock()
+	if h.cancelFn != nil {
+		h.cancelFn()
+		h.cancelFn = nil
+	}
 }
 
 func (h *halConversation) send(userMsg string) (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancelMu.Lock()
+	h.cancelFn = cancel
+	h.cancelMu.Unlock()
+	defer func() {
+		h.cancelMu.Lock()
+		h.cancelFn = nil
+		h.cancelMu.Unlock()
+	}()
+
 	var prompt string
 	if h.sessionID == "" {
-		// First message: include system prompt + all project memories
+		// First message: include system prompt + portfolio summary only (saves tokens)
 		var sb strings.Builder
 		sb.WriteString(halSystemPrompt)
-		memories := loadAllMemories()
-		if len(memories) > 0 {
-			sb.WriteString("\n\n## Known Project Information\n")
-			for name, content := range memories {
-				sb.WriteString(fmt.Sprintf("\n### Project: %s\n%s\n", name, content))
-			}
+		portfolio := loadPortfolio()
+		if portfolio != "" {
+			sb.WriteString("\n\n## Project Portfolio\n")
+			sb.WriteString(portfolio)
 		}
 		sb.WriteString("\n\nUser: ")
 		sb.WriteString(userMsg)
@@ -44,18 +68,27 @@ func (h *halConversation) send(userMsg string) (string, error) {
 
 	// Use "--" to prevent prompt from being parsed as flags
 	args := []string{"-p", "--output-format", "json"}
+	if claudeModel != "" {
+		args = append(args, "--model", claudeModel)
+	}
+	if thinkingBudget != "" {
+		args = append(args, "--thinking-budget", thinkingBudget)
+	}
 	if h.sessionID != "" {
 		args = append(args, "--resume", h.sessionID)
 	}
 	args = append(args, "--", prompt)
 
-	cmd := exec.Command(claudeBin, args...)
+	cmd := exec.CommandContext(ctx, claudeBin, args...)
 
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 
 	out, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() == context.Canceled {
+			return "", errInterrupted
+		}
 		errDetail := strings.TrimSpace(stderr.String())
 		if errDetail != "" {
 			return "", fmt.Errorf("claude: %s", errDetail)

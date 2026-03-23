@@ -6,11 +6,19 @@ import (
 	"time"
 )
 
+type chatMessageData struct {
+	Role    string   `json:"role"`
+	Name    string   `json:"name,omitempty"`
+	Text    string   `json:"text"`
+	Options []string `json:"options,omitempty"`
+}
+
 type sessionData struct {
 	HALSessionID string               `json:"hal_session_id"`
 	BuildStarted bool                 `json:"build_started"`
 	Projects     []projectSessionData `json:"projects"`
 	Workers      []workerSessionData  `json:"workers"`
+	Messages     []chatMessageData    `json:"messages,omitempty"`
 	SavedAt      string               `json:"saved_at"`
 }
 
@@ -34,6 +42,20 @@ func saveSession(m *model) {
 		HALSessionID: m.conversation.sessionID,
 		BuildStarted: m.buildStarted,
 		SavedAt:      time.Now().Format(time.RFC3339),
+	}
+
+	// Save chat messages (cap to last maxMessages)
+	msgs := m.messages
+	if len(msgs) > maxMessages {
+		msgs = msgs[len(msgs)-maxMessages:]
+	}
+	for _, msg := range msgs {
+		sd.Messages = append(sd.Messages, chatMessageData{
+			Role:    msg.role,
+			Name:    msg.name,
+			Text:    msg.text,
+			Options: msg.options,
+		})
 	}
 
 	for _, p := range m.projectSpecs {

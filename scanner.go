@@ -38,11 +38,11 @@ func scanRepo(repoPath string) (string, error) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("# Repository Analysis: %s\n\n", repoPath))
 
-	// 1. Directory tree (max 3 levels deep, max 200 entries)
+	// 1. Directory tree (max 5 levels deep, max 500 entries)
 	sb.WriteString("## Directory Structure\n```\n")
 	count := 0
 	filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || count >= 200 {
+		if err != nil || count >= 500 {
 			return filepath.SkipDir
 		}
 		rel, _ := filepath.Rel(repoPath, path)
@@ -62,7 +62,7 @@ func scanRepo(repoPath string) (string, error) {
 		}
 
 		depth := strings.Count(rel, string(filepath.Separator))
-		if depth > 3 {
+		if depth > 5 {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
@@ -88,17 +88,17 @@ func scanRepo(repoPath string) (string, error) {
 			continue
 		}
 		content := string(data)
-		if len(content) > 3000 {
-			content = content[:3000] + "\n... (truncated)"
+		if len(content) > 5000 {
+			content = content[:5000] + "\n... (truncated)"
 		}
 		sb.WriteString(fmt.Sprintf("## %s\n```\n%s\n```\n\n", name, content))
 	}
 
-	// 3. Sample source files (first 5 found, first 100 lines each)
+	// 3. Sample source files (first 15 found, first 150 lines each)
 	sb.WriteString("## Source File Samples\n\n")
 	sampled := 0
 	filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || sampled >= 5 || info.IsDir() {
+		if err != nil || sampled >= 15 || info.IsDir() {
 			if info != nil && info.IsDir() {
 				base := filepath.Base(path)
 				if strings.HasPrefix(base, ".") || base == "node_modules" ||
@@ -123,8 +123,8 @@ func scanRepo(repoPath string) (string, error) {
 
 		lines := strings.Split(string(data), "\n")
 		preview := lines
-		if len(preview) > 100 {
-			preview = preview[:100]
+		if len(preview) > 150 {
+			preview = preview[:150]
 		}
 
 		sb.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", rel, strings.Join(preview, "\n")))
