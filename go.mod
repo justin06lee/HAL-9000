@@ -1,4 +1,4 @@
-module github.com/justin06lee/hal9000
+module github.com/justin06lee/HAL-9000
 
 go 1.24.2
 
