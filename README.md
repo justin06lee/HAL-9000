@@ -6,6 +6,10 @@
 
 An AI project orchestrator powered by Claude Code. HAL manages multiple software projects simultaneously — scanning repos, delegating work to AI workers, remembering context across sessions, and speaking to you with a synthesized voice.
 
+> **No API keys. No SDK. Just [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).**
+>
+> HAL runs entirely on top of the Claude Code CLI — if you have `claude` installed, you're good to go.
+
 ## Requirements
 
 - **Go 1.21+** — [install](https://go.dev/dl/)
@@ -14,11 +18,9 @@ An AI project orchestrator powered by Claude Code. HAL manages multiple software
 
 ## Install
 
-### From source
-
 ```bash
-git clone https://github.com/justin06lee/multivac-all.git
-cd multivac-all/HAL-9000
+git clone https://github.com/justin06lee/HAL-9000.git
+cd HAL-9000
 go build -o hal9000 .
 ./hal9000
 ```
@@ -76,12 +78,6 @@ HAL speaks responses aloud using [Piper TTS](https://github.com/rhasspy/piper) (
 ### Memory
 
 HAL automatically remembers project context across sessions. Memory is organized per-project with categorized topics (overview, architecture, requirements, tech stack, decisions, notes). A local TF-IDF search index lets HAL retrieve relevant context on demand instead of loading everything at once.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|
-| `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI binary |
 
 ## License
 
