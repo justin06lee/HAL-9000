@@ -13,3 +13,6 @@ projects/session.json
 
 # Claude IDE metadata
 .claude/
+
+# Git worktrees
+.worktrees/
