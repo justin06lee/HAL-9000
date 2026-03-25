@@ -177,6 +177,8 @@ func dirHasDylibs(dir string) bool {
 	return false
 }
 
+const maxDownloadBytes = 500 * 1024 * 1024 // 500 MB
+
 func downloadFile(url, dest string) error {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -191,7 +193,7 @@ func downloadFile(url, dest string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
+	_, err = io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes))
 	return err
 }
 
@@ -205,7 +207,7 @@ func downloadAndExtractTar(url, destDir string) error {
 		return fmt.Errorf("download failed: %d", resp.StatusCode)
 	}
 
-	gz, err := gzip.NewReader(resp.Body)
+	gz, err := gzip.NewReader(io.LimitReader(resp.Body, maxDownloadBytes))
 	if err != nil {
 		return err
 	}

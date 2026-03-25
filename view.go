@@ -152,7 +152,16 @@ func (m model) View() tea.View {
 	sb.WriteByte('\n')
 
 	// ── Bottom: Workers | Chat
-	workerLines := formatWorkers(m.workerStatuses, workerW, bottomH)
+	// Copy the map to avoid data race with Update (maps are reference types)
+	statuses := make(map[string]workerStatus, len(m.workerStatuses))
+	for k, v := range m.workerStatuses {
+		statuses[k] = v
+	}
+	pendingQs := len(m.pendingQuestions)
+	if m.currentQuestion != nil {
+		pendingQs++
+	}
+	workerLines := formatWorkers(statuses, m.orch, pendingQs, workerW, bottomH)
 	var chatLines []string
 	if m.inspecting != "" {
 		chatLines = formatInspection(m.inspecting, m.orch.getWorkerOutput(m.inspecting), m.input.View(), chatW, bottomH, m.chatScroll)
@@ -190,11 +199,16 @@ func (m model) View() tea.View {
 
 // ── Workers panel ───────────────────────────────────────────
 
-func formatWorkers(statuses map[string]workerStatus, w, h int) []string {
+func formatWorkers(statuses map[string]workerStatus, orch *orchestrator, pendingQs, w, h int) []string {
 	lines := make([]string, 0, h)
 
 	lines = append(lines, "\033[38;2;220;50;20;1m WORKERS\033[0m")
 	lines = append(lines, "\033[38;2;60;60;60m "+strings.Repeat("\u2500", w-2)+"\033[0m")
+
+	if pendingQs > 0 {
+		lines = append(lines,
+			fmt.Sprintf(" \033[38;2;255;200;50;1m? %d question(s)\033[0m", pendingQs))
+	}
 
 	if len(statuses) == 0 {
 		lines = append(lines, "\033[38;2;80;80;80;3m No workers yet\033[0m")
@@ -223,8 +237,15 @@ func formatWorkers(statuses map[string]workerStatus, w, h int) []string {
 			}
 			lines = append(lines,
 				fmt.Sprintf(" \033[38;2;%s;1m%s\033[0m \033[38;2;180;180;180m%s\033[0m", color, icon, truncateVisible(name, w-5)))
-			lines = append(lines,
-				fmt.Sprintf("   \033[38;2;%sm%s\033[0m", color, status.String()))
+			// Show activity summary for running/auditing workers
+			activity := orch.getLastActivity(name)
+			if activity != "" && (status == statusRunning || status == statusAuditing) {
+				lines = append(lines,
+					fmt.Sprintf("   \033[38;2;100;100;100;3m%s\033[0m", truncateVisible(activity, w-4)))
+			} else {
+				lines = append(lines,
+					fmt.Sprintf("   \033[38;2;%sm%s\033[0m", color, status.String()))
+			}
 		}
 	}
 

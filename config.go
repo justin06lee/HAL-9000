@@ -23,7 +23,7 @@ var (
 	vectorsDir   string
 	indexFile    string
 	claudeModel  string // --model flag for claude CLI
-	thinkingBudget string // --thinking-budget flag for claude CLI
+	thinkingBudget string // --effort flag for claude CLI
 )
 
 func init() {
@@ -42,19 +42,31 @@ func init() {
 	sessionFile = filepath.Join(baseDir, "projects", "session.json")
 	vectorsDir = filepath.Join(baseDir, "projects", "vectors")
 	indexFile = filepath.Join(vectorsDir, "index.json")
-	os.MkdirAll(specsDir, 0o755)
-	os.MkdirAll(memoryDir, 0o755)
-	os.MkdirAll(vectorsDir, 0o755)
+	if err := os.MkdirAll(specsDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create specs dir: %v\n", err)
+	}
+	if err := os.MkdirAll(memoryDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create memory dir: %v\n", err)
+	}
+	if err := os.MkdirAll(vectorsDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create vectors dir: %v\n", err)
+	}
 	migrateMemories()
 }
 
 const managerSystemPrompt = `You are HAL 9000, an AI project manager orchestrating multiple software projects.
 You have the full project specification below. A worker AI building one of these
-projects has a question. Answer it confidently if you can based on the spec and
-sound engineering judgment. If the question requires the human's subjective input,
-business decision, or information not in the spec, reply with exactly: ESCALATE
+projects has a question. Your job is to answer it AND rewrite your answer as a
+clear, actionable directive that the worker can immediately act on.
 
-Be concise. Give direct, actionable answers.`
+Format your response as a direct instruction to the worker — not a discussion,
+not options, but a clear "do this" statement. Include relevant context from the
+spec so the worker doesn't need to re-derive it.
+
+If the question requires the human's subjective input, a business decision, or
+information that is genuinely not in the spec, reply with exactly: ESCALATE
+
+Do not escalate if you can make a sound engineering judgment call.`
 
 const workerPreamble = `You are a software engineer working on a project. You have full autonomy to build
 the project as specified. If you encounter a decision point where multiple valid

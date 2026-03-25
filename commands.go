@@ -51,6 +51,8 @@ func parseCommand(text string) *slashCommand {
 		return &slashCommand{name: "commands", arg: arg}
 	case "clear":
 		return &slashCommand{name: "clear", arg: arg}
+	case "questions", "q":
+		return &slashCommand{name: "questions", arg: arg}
 	default:
 		return nil
 	}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,7 @@ type model struct {
 	pasteLines    int    // number of lines in the paste
 
 	lastSentText string // last sent message text (for restore on interrupt)
+	lastScanPath string // repo path from most recent /scan, consumed by handleNewSpec
 
 	// Interactive picker
 	pickerActive  bool
@@ -376,6 +378,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				copyToClipboard(text)
 				m.addMsg("system", "", "Copied last HAL response to clipboard.", nil)
 			}
+		case "ctrl+w":
+			names := m.orch.workerNames()
+			sort.Strings(names)
+			if len(names) == 0 {
+				m.addMsg("system", "", "No workers to inspect.", nil)
+			} else if m.inspecting == "" {
+				m.inspecting = names[0]
+				m.chatScroll = 0
+			} else {
+				next := ""
+				for i, n := range names {
+					if n == m.inspecting && i+1 < len(names) {
+						next = names[i+1]
+						break
+					}
+				}
+				if next == "" {
+					m.inspecting = ""
+					m.chatScroll = 0
+				} else {
+					m.inspecting = next
+					m.chatScroll = 0
+				}
+			}
 		case "pgup", "shift+up":
 			m.chatScroll += 10
 		case "pgdown", "shift+down":
@@ -497,8 +523,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								arg = arg[1:]
 							}
 							scanPath := resolvePath(arg)
+							m.lastScanPath = scanPath
 							m.halThinking = true
-								m.thinkingFrame = 0
+							m.thinkingFrame = 0
 							m.addMsg("system", "", fmt.Sprintf("Scanning repository: %s ...", scanPath), nil)
 							conv := m.conversation
 							cmds = append(cmds, scanAndSendToHAL(conv, scanPath, ""))
@@ -540,9 +567,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						return m, tea.Batch(cmds...)
 					case "clear":
-						if len(m.messages) > 0 {
-							m.messages = m.messages[len(m.messages)-1:]
-						}
+						m.messages = nil
 						m.chatScroll = 0
 						return m, tea.Batch(cmds...)
 					case "new":
@@ -552,6 +577,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.halThinking = false
 						m.currentQuestion = nil
 						m.pendingQuestions = nil
+						m.lastScanPath = ""
 						saveSession(&m)
 						greeting := timeGreeting()
 						m.addMsg("hal", "", greeting+" Fresh session started. Your projects and workers are still here.", nil)
@@ -586,11 +612,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.effortSelected = -1
 						}
 						return m, tea.Batch(cmds...)
+					case "questions":
+						total := len(m.pendingQuestions)
+						if m.currentQuestion != nil {
+							total++
+						}
+						if total == 0 {
+							m.addMsg("system", "", "No pending questions.", nil)
+						} else {
+							// Show current question first
+							if m.currentQuestion != nil {
+								m.addMsg("question", m.currentQuestion.name, m.currentQuestion.text, m.currentQuestion.options)
+							}
+							// Show queued questions
+							for i, q := range m.pendingQuestions {
+								m.addMsg("system", "", fmt.Sprintf("Queued #%d from %s: %s", i+1, q.name, q.text), nil)
+							}
+							m.addMsg("system", "", fmt.Sprintf("%d question(s) pending. Answer the current one to advance the queue.", total), nil)
+						}
+						return m, tea.Batch(cmds...)
 					case "commands":
 						helpText := `Projects
   /scan <path>        Scan & memorize a repo
   /discontinue        Remove a project
   /inspect            View worker output
+
+Workers
+  /questions          View & answer pending questions
+  Ctrl+W              Cycle worker inspection
 
 Memory
   /memory             Browse stored memory
@@ -649,6 +698,7 @@ Keys
 				} else {
 					// Auto-detect repo paths in natural language
 					if repoPath := detectRepoPath(text); repoPath != "" {
+						m.lastScanPath = repoPath
 						m.halThinking = true
 						m.thinkingFrame = 0
 						m.addMsg("system", "", fmt.Sprintf("Detected repo path: %s — scanning...", repoPath), nil)
@@ -768,13 +818,8 @@ Keys
 		cmds = append(cmds, waitForStatus(m.orch.statusCh))
 
 	case workerOutputMsg:
-		text := strings.TrimSpace(msg.text)
-		if text != "" {
-			if len(text) > 500 {
-				text = text[:500] + "..."
-			}
-			m.addMsg("worker", msg.name, text, nil)
-		}
+		// Output is stored in worker's outputLog and viewable via /inspect.
+		// Don't flood the chat with every streaming fragment.
 		cmds = append(cmds, waitForOutput(m.orch.outputCh))
 
 	case workerQuestionMsg:
@@ -785,6 +830,11 @@ Keys
 			m.currentQuestion = &q
 			m.addMsg("question", q.name, q.text, q.options)
 			m.voice.sayShort("Question from " + q.name)
+		} else {
+			// Question queued while another is active — notify with count
+			total := len(m.pendingQuestions) + 1 // +1 for currentQuestion
+			m.voice.sayShort(fmt.Sprintf("You have %d questions pending.", total))
+			m.addMsg("system", "", fmt.Sprintf("%d questions pending. Use /questions to review.", total), nil)
 		}
 		cmds = append(cmds, waitForQuestion(m.orch.questionCh))
 	}
@@ -983,7 +1033,15 @@ func handleNewSpec(m model, specText string) model {
 		safeName = "project"
 	}
 	safeName = filepath.Base(safeName) // strip any path separators
-	repoPath := filepath.Join(filepath.Dir(specsDir), safeName)
+
+	// Use scanned repo path if available (from /scan), otherwise create under working dir
+	var repoPath string
+	if m.lastScanPath != "" {
+		repoPath = m.lastScanPath
+		m.lastScanPath = ""
+	} else {
+		repoPath = filepath.Join(filepath.Dir(specsDir), safeName)
+	}
 
 	filePath, err := saveSpec(name, desc, repoPath, specText)
 	if err != nil {
@@ -1132,8 +1190,8 @@ type claudeModelEntry struct {
 }
 
 var claudeModelList = []claudeModelEntry{
-	{"Opus 4.6", "claude-opus-4-20250514"},
-	{"Sonnet 4.6", "claude-sonnet-4-20250514"},
+	{"Opus 4.6", "claude-opus-4-6"},
+	{"Sonnet 4.6", "claude-sonnet-4-6"},
 	{"Haiku 4.5", "claude-haiku-4-5-20251001"},
 }
 

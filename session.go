@@ -39,7 +39,7 @@ type workerSessionData struct {
 
 func saveSession(m *model) {
 	sd := sessionData{
-		HALSessionID: m.conversation.sessionID,
+		HALSessionID: m.conversation.getSessionID(),
 		BuildStarted: m.buildStarted,
 		SavedAt:      time.Now().Format(time.RFC3339),
 	}

@@ -86,10 +86,11 @@ func tokenize(text string) []string {
 
 func stem(word string) string {
 	n := len(word)
-	if n > 5 && strings.HasSuffix(word, "ing") {
-		return word[:n-3]
+	// Check longer suffixes first to avoid false matches
+	if n > 6 && strings.HasSuffix(word, "tion") {
+		return word[:n-4]
 	}
-	if n > 5 && strings.HasSuffix(word, "tion") {
+	if n > 6 && strings.HasSuffix(word, "ing") {
 		return word[:n-3]
 	}
 	if n > 4 && strings.HasSuffix(word, "ed") {
@@ -373,8 +374,14 @@ func rebuildIndex() {
 }
 
 func runRAGSearch(query string) string {
-	idx, err := LoadIndex()
-	if err != nil || NeedsRebuild() {
+	var idx *VectorIndex
+	var err error
+	if NeedsRebuild() {
+		idx, err = BuildIndex()
+	} else {
+		idx, err = LoadIndex()
+	}
+	if err != nil || idx == nil {
 		idx, err = BuildIndex()
 		if err != nil {
 			return "[Search failed: could not build index]"

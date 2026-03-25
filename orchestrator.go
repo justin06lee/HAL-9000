@@ -49,17 +49,18 @@ func (s workerStatus) String() string {
 }
 
 type workerState struct {
-	mu         sync.Mutex
-	name       string
-	repoPath   string
-	spec       string
-	status     workerStatus
-	sessionID  string
-	errMsg     string
-	question   *workerQuestion
-	outputLog  []string
-	isAudit    bool
-	parentName string
+	mu           sync.Mutex
+	name         string
+	repoPath     string
+	spec         string
+	status       workerStatus
+	sessionID    string
+	errMsg       string
+	question     *workerQuestion
+	outputLog    []string
+	lastActivity string // short summary of what the worker is doing
+	isAudit      bool
+	parentName   string
 }
 
 type workerQuestion struct {
@@ -154,11 +155,52 @@ func (o *orchestrator) emitOutput(w *workerState, text string) {
 	if len(w.outputLog) > 5000 {
 		w.outputLog = w.outputLog[len(w.outputLog)-5000:]
 	}
+	// Extract activity summary from meaningful lines
+	if activity := extractActivity(text); activity != "" {
+		w.lastActivity = activity
+	}
 	w.mu.Unlock()
 	select {
 	case o.outputCh <- workerOutputMsg{name: w.name, text: text}:
 	default:
 	}
+}
+
+// extractActivity pulls a short status line from worker output.
+// Looks for tool use patterns (file edits, commands) and status lines.
+func extractActivity(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) < 5 {
+		return ""
+	}
+	// Common Claude Code tool patterns
+	for _, prefix := range []string{
+		"Creating ", "Writing ", "Editing ", "Reading ",
+		"Running ", "Installing ", "Building ", "Testing ",
+		"Updating ", "Adding ", "Removing ", "Deleting ",
+		"Configuring ", "Setting up ", "Initializing ",
+		"Fixing ", "Implementing ", "Refactoring ",
+	} {
+		if strings.HasPrefix(text, prefix) {
+			line := strings.SplitN(text, "\n", 2)[0]
+			if len(line) > 50 {
+				line = line[:47] + "..."
+			}
+			return line
+		}
+	}
+	return ""
+}
+
+// getLastActivity returns the worker's last activity string.
+func (o *orchestrator) getLastActivity(name string) string {
+	w := o.getWorker(name)
+	if w == nil {
+		return ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastActivity
 }
 
 func (o *orchestrator) getWorkerOutput(name string) []string {
@@ -192,7 +234,6 @@ func (o *orchestrator) runAuditWorker(w *workerState) {
 	prompt := securityAuditPreamble + "\n\nThe repository to audit is at: " + w.repoPath +
 		"\nScan all source files. Fix every issue you find."
 
-	os.MkdirAll(w.repoPath, 0o755)
 	o.spawnClaude(w, prompt, false, 0)
 }
 
@@ -227,15 +268,7 @@ func (o *orchestrator) runWorker(w *workerState) {
 		"\n\nBuild this project now. The repository is at: " + w.repoPath +
 		"\nStart by creating the project structure, then implement all features."
 
-	os.MkdirAll(w.repoPath, 0o755)
-
-	gitDir := filepath.Join(w.repoPath, ".git")
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-		cmd := exec.Command("git", "init")
-		cmd.Dir = w.repoPath
-		cmd.Run()
-	}
-
+	prepareRepo(w.repoPath, w.name)
 	o.spawnClaude(w, prompt, false, 0)
 }
 
@@ -248,7 +281,7 @@ const maxQuestionDepth = 5
 
 func (o *orchestrator) spawnClaude(w *workerState, prompt string, isContinue bool, questionDepth int) {
 	// Use "--" to separate flags from prompt (prevents flag injection)
-	args := []string{"-p", "--output-format", "stream-json", "--dangerously-skip-permissions"}
+	args := []string{"-p", "--output-format", "stream-json", "--permission-mode", "auto"}
 
 	w.mu.Lock()
 	sid := w.sessionID

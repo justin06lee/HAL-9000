@@ -25,6 +25,13 @@ type halConversation struct {
 	cancelFn  context.CancelFunc
 }
 
+// getSessionID returns the session ID under lock.
+func (h *halConversation) getSessionID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sessionID
+}
+
 // interrupt cancels any in-flight send
 func (h *halConversation) interrupt() {
 	h.cancelMu.Lock()
@@ -72,7 +79,7 @@ func (h *halConversation) send(userMsg string) (string, error) {
 		args = append(args, "--model", claudeModel)
 	}
 	if thinkingBudget != "" {
-		args = append(args, "--thinking-budget", thinkingBudget)
+		args = append(args, "--effort", thinkingBudget)
 	}
 	if h.sessionID != "" {
 		args = append(args, "--resume", h.sessionID)
